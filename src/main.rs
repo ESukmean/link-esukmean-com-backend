@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use std::collections::*;
 use std::sync::atomic::Ordering;
 
+#[derive(Debug)]
 pub struct RemoveInfo {
 	pub at: std::time::Instant,
 	pub link: String,
@@ -31,7 +32,11 @@ lazy_static! {
 
 #[inline(always)]
 fn instant_to_remove() -> std::time::Instant {
-	return std::time::Instant::now() + std::time::Duration::from_secs(3 * 60 * 60);
+	return instant_now() + std::time::Duration::from_secs(3 * 60 * 60);
+}
+#[inline(always)]
+fn instant_now() -> std::time::Instant {
+	return std::time::Instant::now();
 }
 
 #[get("/create/<url>")]
@@ -54,7 +59,7 @@ fn create_inner(url: String, lock: Option<parking_lot::RwLockWriteGuard<std::vec
 	// G_LINK_TO_CODE 조회때는 있는데, 그 사이에 다른 쓰레드에서 G_REMOVE_QUEUE 에 따라서 삭제 시도하면 중간에 펑! 해버리는것
 	G_CREATE_CNT.fetch_add(1, Ordering::SeqCst);
 
-	let LOCK_REM_QUEUE = match lock {
+	let mut LOCK_REM_QUEUE = match lock {
 		None => G_REMOVE_QUEUE.write(),
 		Some(l) => l
 	};
@@ -62,28 +67,28 @@ fn create_inner(url: String, lock: Option<parking_lot::RwLockWriteGuard<std::vec
 	let if_exist_with_code = {
 		let table = G_LINK_TO_CODE.read();
 
-		G_LINK_TO_CODE.get(&url).map(|code| code.clone())
+		table.get(&url).map(|code| code.clone())
 	};
 
 	let result = match if_exist_with_code {
 		Some(code) => {
-			let pos = G_REMOVE_QUEUE.iter().pos(|item| item.code == code);
+			let pos = LOCK_REM_QUEUE.iter().position(|item| item.code == code);
 			match pos {
 				None => {
 					// 위에서 Lock이 걸린상태여서... None이 나올 리는 없긴한데... 혹시 몰라서..
 					// None이 나오면 LINK_TO_CODE하고 REMOVE_QUEUE하고 동기화가 안되었다는것.
 					// LINK_TO_CODE 와 CODE_TO_LINK 에서 항목을 제거함. 그리고 새로 시도.
 
-					G_LINK_TO_CODE.remove(&url);
-					G_CODE_TO_LINK.remove(&code);
+					G_LINK_TO_CODE.write().remove(&url);
+					G_CODE_TO_LINK.write().remove(&code);
 
 					//주의 recursive할 수 있음! write-lock을 
-					return create(url, Some(LOCK_REM_QUEUE));
+					return create_inner(url, Some(LOCK_REM_QUEUE));
 				},
 				Some(p) => {
-					let mut rinfo = G_REMOVE_QUEUE.remove(p).unwrap();
+					let mut rinfo = LOCK_REM_QUEUE.remove(p);
 					rinfo.at = instant_to_remove();
-					G_REMOVE_QUEUE.push(rinfo);
+					LOCK_REM_QUEUE.push(rinfo);
 
 					Some(code)
 				}
@@ -95,7 +100,7 @@ fn create_inner(url: String, lock: Option<parking_lot::RwLockWriteGuard<std::vec
 			let code = 
 				loop {
 					let rnd = rnd.gen_range(0, 999999).to_string();
-					if G_CODE_TO_LINK.read().contains_key(rnd) == false {
+					if G_CODE_TO_LINK.read().contains_key(&rnd) == false {
 						break rnd;
 					}
 				};
@@ -107,8 +112,10 @@ fn create_inner(url: String, lock: Option<parking_lot::RwLockWriteGuard<std::vec
 			};
 
 			{ G_CODE_TO_LINK.write().insert(code.clone(), url.clone()); }
-			{ G_LINK_TO_CODE.write().insert(url, code); }
+			{ G_LINK_TO_CODE.write().insert(url, code.clone()); }
 			{ LOCK_REM_QUEUE.push(rinfo); }
+
+			Some(code)
 		}
 	};
 
@@ -127,6 +134,34 @@ fn load(code: u8) -> Option<String> {
 	};
 }
 
+#[get("/info-esm-status")]
+fn info() -> String {
+	return format!("{:?}\n<br>{:?}\n<br>{:?}", G_REMOVE_QUEUE.read(), G_CODE_TO_LINK.read(), G_LINK_TO_CODE.read());
+}
+
+/// CREATE_CNT를 검증하는건 여기에 포함되지 않음! 구현하는 측에서 꼭 체크할 것.
+fn remove_expired() {
+	// 삭제 할 게 없으면 굳이 write lock까지 걸 필요는 없음. Read선에서 해결
+	let expired_exist = {
+		let rque = G_REMOVE_QUEUE.read();
+		if rque.len() == 0 { return; }
+
+		if rque[0].at > instant_now() { return; }
+
+		true
+	};
+
+	// 위에서 false 될 경우에 미리 return을 했기에 따로 처리 없는것. 
+	// return 없이 넘어가는 경우가 있다면 추가 코드 작성 해야함.
+
+	let mut rque = G_REMOVE_QUEUE.write();
+	while rque.len() > 0 {
+		if rque[0].at > instant_now() { break; }
+
+		rque.remove(0);
+	}
+}
+
 fn main() {
 	use rocket::config::{Config, Environment};
 
@@ -137,6 +172,6 @@ fn main() {
 		.unwrap();
 
 	rocket::custom(config)
-		.mount("/backend", routes![create, load])
+		.mount("/backend", routes![create, load, info])
 		.launch();
 }
